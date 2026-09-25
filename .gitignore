@@ -1,0 +1,7 @@
+# real data + real->fake mapping: never commit
+raw/
+samples_real/
+mapping.json
+mapping.tmp
+out/review_LOCAL_ONLY/
+known_entities.csv
