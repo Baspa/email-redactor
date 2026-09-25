@@ -253,6 +253,7 @@ class Mapper:
             self.data = {"salt": secrets.token_hex(16), "maps": {}, "files": {}}
         self._fakers: dict = {}
         self.corpus_tokens: set[str] = set()  # filled by main() from all raw inputs
+        self.cap_words: dict[str, set[str]] = {}  # folded -> capitalized spellings seen in inputs
 
     def rng(self, cat: str, value: str) -> random.Random:
         return random.Random(hashlib.sha256(f"{self.data['salt']}|{cat}|{value}".encode()).hexdigest())
@@ -467,8 +468,8 @@ class Redactor:
 
     # ---------- entity registration ------------------------------------- #
     def _is_kept(self, value: str) -> bool:
-        v = value.casefold()
-        return any(t.casefold() in v for t in self.keep_terms)
+        # whole words only: keep term "MAN" must not match "Hermann" or "Germany"
+        return any(re.search(LETTER_BOUNDARY_L + re.escape(t) + LETTER_BOUNDARY_R, value, re.I) for t in self.keep_terms)
 
     def _add_entity(self, original: str, fake: str, source: str):
         original = original.strip()
@@ -576,7 +577,23 @@ class Redactor:
         # 5. anything ending in a legal form: "Yılmaz Otomotiv San. ve Tic. Ltd. Şti.", "Rojas S.A.S."
         for m in COMPANY_INLINE.finditer(text):
             self.add_company(f"{m.group(1)} {m.group(2)}", "legal-suffix")
-        # 6. optional NER
+        # 6. street names (so the same street in another address format is replaced too)
+        for rule, regex, _h in self.rules:
+            if rule.startswith("addr_") and "name" in regex.groupindex:
+                for m in regex.finditer(text):
+                    street = m.group("name").strip()
+                    if len(street) >= 5 and not self._is_kept(street):
+                        self._add_entity(street, self.m.get("street", street, self._fake_street), "street")
+        # 7. customer domains, so bare mentions ("see firma.de") are replaced too
+        for m in EMAIL_RE.finditer(text):
+            dom = m.group(0).rsplit("@", 1)[1]
+            if not self._keep_domain(dom):
+                self._add_entity(dom.lower(), self._domain(dom), "domain")
+        # 8. name parts of email addresses
+        for m in EMAIL_RE.finditer(text):
+            if not self._keep_domain(m.group(0).rsplit("@", 1)[1]) or m.group(0).split("@")[0].lower() not in GENERIC_LOCALS:
+                self._local_parts(m.group(0))
+        # 9. optional NER
         if self.ner:
             for label, value in self.ner(text):
                 if "\n" in value or "@" in value or any(c.isdigit() for c in value) or len(value) > 60:
@@ -605,10 +622,28 @@ class Redactor:
         if hit:  # take the real spelling from the text: "yilmaz" -> "Yılmaz"
             self.add_person(text[hit.start():hit.end()], "email-local-part")
 
+    def _local_parts(self, addr: str):
+        """'j.surname@' -> 'Surname' written anywhere in any email. Runs last, so real first names
+        (found via titles/greetings) already have a first-name fake."""
+        local = addr.split("@")[0]
+        parts = [p for p in re.split(r"[._\-]", local) if p]
+        if local.lower() in GENERIC_LOCALS or len(parts) > 3 or not all(p.isalpha() for p in parts):
+            return
+        for p in parts:  # "j.surname@" -> "Surname" written anywhere else in any email
+            if len(p) < 3 or p.lower() in GENERIC_LOCALS | ROLE_WORDS:
+                continue
+            key = ascii_fold(p).casefold()
+            for word in self.m.cap_words.get(key, ()):
+                fake = self.m.lookup("first_name", word) or self.m.get("last_name", word, self._fake_last)
+                self._add_entity(word, fake, "email-local-part")
+
     # ---------- replacement rules ---------------------------------------- #
     def _keep_domain(self, domain: str) -> bool:
         domain = domain.lower()
-        return any(domain == k or domain.endswith("." + k) for k in self.keep_domains)
+        if any(domain == k or domain.endswith("." + k) for k in self.keep_domains):
+            return True
+        terms = {re.sub(r"[\s\-]", "", t.casefold()) for t in self.keep_terms}
+        return any(label.replace("-", "") in terms for label in domain.split(".")[:-1])
 
     def _fake_domain(self, orig: str, rng) -> str:
         labels = orig.split(".")
@@ -780,10 +815,16 @@ class Redactor:
             store.append(value)
             return ph_encode(len(store) - 1)
 
-        for term in sorted(self.keep_terms, key=len, reverse=True):
-            text = re.sub(re.escape(term), lambda m: protect(m.group(0)), text, flags=re.I)
+        def protect_keep_terms(text):
+            for term in sorted(self.keep_terms, key=len, reverse=True):
+                text = re.sub(LETTER_BOUNDARY_L + re.escape(term) + LETTER_BOUNDARY_R,
+                              lambda m: protect(m.group(0)), text, flags=re.I)
+            return text
 
+        kept = False
         for name, regex, handler in self.rules:
+            if not kept and name not in ("iban", "vat", "url", "email"):
+                text, kept = protect_keep_terms(text), True
             def sub(m, name=name, handler=handler):
                 fake = handler(m)
                 if fake is None:
@@ -792,6 +833,23 @@ class Redactor:
                     log.append((name, m.group(0), fake))
                 return protect(fake)
             text = regex.sub(sub, text)
+        if not kept:
+            text = protect_keep_terms(text)
+
+        # a number replaced once (postcode, ID, phone...) must also be replaced where no rule caught it
+        repeats: dict[str, str] = {}
+        for _rule, orig, fake in log:
+            if len(orig) == len(fake):
+                for d in re.finditer(r"\d{5,}", orig):
+                    if fake[d.start():d.end()].isdigit():
+                        repeats.setdefault(d.group(0), fake[d.start():d.end()])
+        if repeats:
+            rep_re = re.compile(r"(?<!\d)(?:" + "|".join(sorted(map(re.escape, repeats), key=len, reverse=True)) + r")(?!\d)")
+
+            def rep_sub(m):
+                log.append(("repeat-number", m.group(0), repeats[m.group(0)]))
+                return protect(repeats[m.group(0)])
+            text = rep_re.sub(rep_sub, text)
 
         if self.entities:
             variants: dict[str, str] = {}
@@ -805,8 +863,8 @@ class Redactor:
 
             def ent_sub(m):
                 hit = m.group(0)
-                if " " not in hit and hit not in variants:
-                    return hit  # single words: exact case only ("Bos" the name, not "bos" the word)
+                if " " not in hit and "." not in hit and len(hit) < 6 and hit not in variants:
+                    return hit  # short single words: exact case only ("Bos" the name, not "bos" the word)
                 fake = variants.get(hit) or lower.get(hit.casefold())
                 if is_upper_word(hit):
                     fake = fake.upper()
@@ -866,7 +924,7 @@ def review(out: str, log, redactor: Redactor, mapper: Mapper) -> tuple[list[str]
     P = "|".join(PARTICLES)
     for m in re.finditer(rf"{CAP_WORD}(?:\s+(?:(?:{P})\s+)*{CAP_WORD})+", out):
         words = [w.casefold() for w in re.findall(r"[^\W\d_]+", m.group(0)) if w.casefold() not in PARTICLES]
-        if words and not all(w in ignore for w in words) and not any(k in m.group(0).casefold() for k in keep):
+        if words and not all(w in ignore for w in words) and not redactor._is_kept(m.group(0)):
             suspects.append(f"capitalized phrase: {m.group(0)!r}")
     for m in re.finditer(r"(?<![\w.])\d{6,}(?![\w.])", out):
         if any(m.group(0) in f for f in inserted):
@@ -954,16 +1012,30 @@ def main():
         raw = assemble(headers, body, attachments)
         mapper.corpus_tokens |= {t for w in re.findall(rf"[{UP}][^\W\d_]+", raw) for t in name_tokens(w)}
         mapper.corpus_tokens |= {t for e in EMAIL_RE.findall(raw) for t in name_tokens(e)}
+        for w in re.findall(rf"{LETTER_BOUNDARY_L}[{UP}][{LO}]{{2,}}{LETTER_BOUNDARY_R}", raw):
+            mapper.cap_words.setdefault(ascii_fold(w).casefold(), set()).add(w)
 
+    # pass 1: harvest names from ALL emails, each in its own locale, so a customer found in
+    # email A is also replaced in email B
+    texts, locales, found = {}, {}, {}
+    for path in files:
+        texts[path] = assemble(*loaded[path])
+        redactor.entities = {}
+        redactor.locale = locales[path] = redactor.detect_locale(texts[path])
+        redactor.harvest(texts[path])
+        found[path] = redactor.entities
+    all_entities = dict(base_entities)
+    for ents in found.values():
+        for k, v in ents.items():
+            all_entities.setdefault(k, v)
+
+    # pass 2: redact
     total_leaks = 0
     for path in files:
         fid = mapper.file_id(path.read_bytes(), path.name)
-        headers, body, attachments = loaded[path]
-        text = assemble(headers, body, attachments)
-
-        redactor.entities = dict(base_entities)
-        redactor.locale = redactor.detect_locale(text)
-        redactor.harvest(text)
+        text = texts[path]
+        redactor.entities = all_entities
+        redactor.locale = locales[path]
         out, log = redactor.redact(text)
         leaks, suspects = review(out, log, redactor, mapper)
         total_leaks += len(leaks)
@@ -972,7 +1044,9 @@ def main():
         expected = red_dir / f"{fid}.expected.json"
         if not expected.exists():
             expected.write_text("{}\n", "utf-8")
-        write_review(rev_dir / f"{fid}.review.md", fid, redactor.locale, log, leaks, suspects, redactor.entities)
+        hit = {o for r, o, _f in log if r == "entity"}
+        shown = {k: v for k, v in all_entities.items() if k in found[path] or k in hit}
+        write_review(rev_dir / f"{fid}.review.md", fid, redactor.locale, log, leaks, suspects, shown)
         status = "LEAK" if leaks else "ok  "
         print(f"[{status}] {fid}  locale={redactor.locale:<3} replacements={len(log):<3} suspects={len(suspects)}")
 
