@@ -5,3 +5,7 @@ mapping.json
 mapping.tmp
 out/review_LOCAL_ONLY/
 known_entities.csv
+out/
+config.json
+__pycache__/
+.DS_Store
